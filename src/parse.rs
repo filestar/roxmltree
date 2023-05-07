@@ -244,6 +244,9 @@ pub struct ParsingOptions {
     /// Default: false
     pub allow_dtd: bool,
 
+    /// Continue in the face of some parse errors.
+    pub forgiving: bool,
+
     /// Sets the maximum number of nodes to parse.
     ///
     /// Useful when dealing with random input to limit memory usage.
@@ -258,6 +261,7 @@ impl Default for ParsingOptions {
     fn default() -> Self {
         ParsingOptions {
             allow_dtd: false,
+            forgiving: false,
             nodes_limit: core::u32::MAX,
         }
     }
@@ -520,6 +524,7 @@ fn parse(text: &str, opt: ParsingOptions) -> Result<Document, Error> {
         &mut tag_name,
         &mut pd,
         &mut doc,
+        opt.forgiving,
     )?;
 
     if !doc.root().children().any(|n| n.is_element()) {
@@ -545,6 +550,7 @@ fn process_tokens<'input>(
     tag_name: &mut TagNameSpan<'input>,
     pd: &mut ParserData<'input>,
     doc: &mut Document<'input>,
+    forgiving: bool,
 ) -> Result<(), Error> {
     for token in parser {
         let token = token?;
@@ -576,7 +582,7 @@ fn process_tokens<'input>(
                 )?;
             }
             xmlparser::Token::Text { text } => {
-                process_text(text, parent_id, loop_detector, pd, doc)?;
+                process_text(text, parent_id, loop_detector, pd, doc, forgiving)?;
             }
             xmlparser::Token::Cdata { text, span } => {
                 append_text(
@@ -608,7 +614,9 @@ fn process_tokens<'input>(
                 value,
                 span,
             } => {
-                process_attribute(prefix, local, value, span, loop_detector, pd, doc)?;
+                if let Err(error) = process_attribute(prefix, local, value, span, loop_detector, pd, doc) {
+                    forgive(forgiving, error)?;
+                }
             }
             xmlparser::Token::ElementEnd { end, span } => {
                 process_element(*tag_name, end, span, &mut parent_id, pd, doc)?;
@@ -906,6 +914,7 @@ fn process_text<'input>(
     loop_detector: &mut LoopDetector,
     pd: &mut ParserData<'input>,
     doc: &mut Document<'input>,
+    forgiving: bool,
 ) -> Result<(), Error> {
     // Add text as is if it has only valid characters.
     if !text.as_str().bytes().any(|b| b == b'&' || b == b'\r') {
@@ -927,8 +936,8 @@ fn process_text<'input>(
     let mut is_as_is = false; // TODO: explain
     let mut s = Stream::from_substr(doc.text, text.range());
     while !s.at_end() {
-        match parse_next_chunk(&mut s, &pd.entities)? {
-            NextChunk::Byte(c) => {
+        match parse_next_chunk(&mut s, &pd.entities) {
+            Ok(NextChunk::Byte(c)) => {
                 if is_as_is {
                     pd.buffer.push_raw(c);
                     is_as_is = false;
@@ -936,7 +945,7 @@ fn process_text<'input>(
                     pd.buffer.push_from_text(c, s.at_end());
                 }
             }
-            NextChunk::Char(c) => {
+            Ok(NextChunk::Char(c)) => {
                 for b in CharToBytes::new(c) {
                     if loop_detector.depth > 0 {
                         pd.buffer.push_from_text(b, s.at_end());
@@ -948,7 +957,7 @@ fn process_text<'input>(
                     }
                 }
             }
-            NextChunk::Text(fragment) => {
+            Ok(NextChunk::Text(fragment)) => {
                 is_as_is = false;
 
                 if !pd.buffer.is_empty() {
@@ -970,11 +979,16 @@ fn process_text<'input>(
 
                 let parser = xmlparser::Tokenizer::from_fragment(doc.text, fragment.range());
                 let mut tag_name = TagNameSpan::new_null();
-                process_tokens(parser, parent_id, loop_detector, &mut tag_name, pd, doc)?;
+                process_tokens(parser, parent_id, loop_detector, &mut tag_name, pd, doc, forgiving)?;
                 pd.buffer.clear();
 
                 loop_detector.dec_depth();
             }
+            // TODO: it would be nice to be forgiving of errors here, but the code that generates
+            // errors was not written with continuing in mind, so I'm worried about the potential
+            // for introducing an infinite loop (e.g., because the cursor is not incremented)
+            //     Err(error) => forgive(forgiving, error)?,
+            Err(error) => return Err(error),
         }
     }
 
@@ -1122,6 +1136,15 @@ fn is_normalization_required(text: &StrSpan) -> bool {
     }
 
     text.as_str().bytes().any(check)
+}
+
+fn forgive(forgiving: bool, error: Error) -> Result<(), Error> {
+    if forgiving {
+        log::warn!("{}", error);
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 fn _normalize_attribute(

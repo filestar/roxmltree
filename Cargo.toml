@@ -16,6 +16,7 @@ members = ["benches"]
 exclude = ["test-apps", "testing-tools"]
 
 [dependencies]
+log = "0.4"
 xmlparser = "0.13.5"
 
 [features]
